@@ -1,0 +1,56 @@
+{
+  "name": "agentgrid",
+  "version": "0.1.0",
+  "description": "A peer-to-peer grid for renting and sharing AI agent compute. Lend your spare Claude Code / Codex capacity and earn credits; spend credits to have other people's agents run your tasks.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "agentgrid": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lxyang20131208-star/agentgrid.git"
+  },
+  "homepage": "https://github.com/lxyang20131208-star/agentgrid#readme",
+  "bugs": {
+    "url": "https://github.com/lxyang20131208-star/agentgrid/issues"
+  },
+  "keywords": [
+    "ai-agent",
+    "claude-code",
+    "codex",
+    "compute-marketplace",
+    "peer-to-peer",
+    "token-metering",
+    "agent-network"
+  ],
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "commander": "^12.1.0",
+    "ws": "^8.18.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^20.17.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
