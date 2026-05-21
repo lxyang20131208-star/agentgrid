@@ -30,6 +30,15 @@ export const WORKER_REGISTER = z.object({
   adapters: z.array(ADAPTER).min(1),
   /** The worker's price: buyers pay measuredCost * priceMultiplier. */
   priceMultiplier: z.number().min(0.1).max(100).optional(),
+  /** Maximum jobs this worker runs concurrently. */
+  capacity: z.number().int().min(1).max(64).optional(),
+});
+
+export const ATTESTATION = z.object({
+  provider: z.string().max(64),
+  model: z.string().max(128).nullable(),
+  providerReportedCost: z.boolean(),
+  rawResponseDigest: z.string().max(128),
 });
 
 export const WORKER_HEARTBEAT = z.object({
@@ -59,6 +68,7 @@ export const WORKER_JOB_RESULT = z.object({
   resultText: z.string(),
   outputFiles: z.array(JOB_FILE),
   tokenUsage: TOKEN_USAGE,
+  attestation: ATTESTATION,
 });
 
 export const WORKER_JOB_FAILED = z.object({

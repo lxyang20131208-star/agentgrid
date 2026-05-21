@@ -24,7 +24,7 @@ test('a job flows from buyer to worker and credits settle', async () => {
   const seller = coordinator.register('seller@example.com');
 
   const worker = new Worker({
-    coordinatorUrl: url,
+    coordinatorUrls: [url],
     apiKey: seller.apiKey,
     name: 'test-worker',
     adapters: ['mock'],

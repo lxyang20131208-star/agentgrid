@@ -4,7 +4,7 @@
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, relative, sep } from 'node:path';
-import type { JobFile, TokenUsage } from '../shared/types.js';
+import type { Attestation, JobFile, TokenUsage } from '../shared/types.js';
 import type { AgentAdapter, SandboxedRun } from './adapters/index.js';
 import type { Sandbox } from './sandbox.js';
 
@@ -18,6 +18,7 @@ export interface RunnerResult {
   resultText: string;
   outputFiles: JobFile[];
   tokenUsage: TokenUsage;
+  attestation: Attestation;
 }
 
 export interface RunnerOptions {
@@ -81,6 +82,7 @@ export async function runJob(
       resultText: result.resultText,
       outputFiles,
       tokenUsage: result.tokenUsage,
+      attestation: result.attestation,
     };
   } finally {
     rmSync(workdir, { recursive: true, force: true });

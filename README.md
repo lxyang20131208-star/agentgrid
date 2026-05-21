@@ -89,6 +89,22 @@ AgentGrid is a real two-sided market, not just a job queue.
   [`docs/TRUST-AND-SECURITY.md`](docs/TRUST-AND-SECURITY.md) and
   [`docker/Dockerfile`](docker/Dockerfile).
 
+- **Attestation & result checks.** Each result carries an *attestation* — the
+  provider, model, and a SHA-256 digest of the raw provider response — stored
+  immutably so metering is auditable. The coordinator also runs a structural
+  check on every result and rejects ones that are empty or are error dumps.
+
+- **Disputes & arbitration.** With an acceptance window configured
+  (`coordinator --acceptance-window`), a finished job is *delivered* rather
+  than paid immediately. The buyer can `accept` it (pay now), `dispute` it
+  (hold payment), or let the window lapse (auto-accept). A disputed job is
+  arbitrated by the coordinator admin with `agentgrid resolve`.
+
+- **Concurrency & federation.** A worker advertises a `--capacity` and runs
+  that many jobs at once. A coordinator can list `--peers`, and
+  `agentgrid federation` shows the aggregated view across the whole network
+  (each coordinator keeps its own ledger).
+
 ---
 
 ## Quickstart
@@ -142,13 +158,17 @@ what is detected on your machine.
 | ----------------------------- | ------------------------------------------------------ |
 | `agentgrid coordinator`       | Run the broker for a network.                          |
 | `agentgrid register --email`  | Create an account and save its API key.                |
-| `agentgrid worker`            | Run a worker. `--price` to set your rate, `--sandbox` to isolate jobs. |
-| `agentgrid submit <prompt>`   | Submit a job (spends credits). `--wait` to block, `--max-price` to cap. |
+| `agentgrid worker`            | Run a worker. `--price`, `--capacity`, `--sandbox`, multi `--url`. |
+| `agentgrid submit <prompt>`   | Submit a job (spends credits). `--wait`, `--max-price`. |
 | `agentgrid status <jobId>`    | Show a job's status and result.                        |
+| `agentgrid accept <jobId>`    | Accept a delivered job — pays the worker now.           |
+| `agentgrid dispute <jobId>`   | Dispute a delivered job — holds payment for arbitration. |
+| `agentgrid resolve <jobId> <ruling>` | Arbitrate a dispute (admin only).               |
 | `agentgrid jobs`              | List your recent jobs.                                 |
 | `agentgrid balance`           | Show your credit balance.                              |
 | `agentgrid workers`           | List workers on the network.                           |
 | `agentgrid stats`             | Show network-wide statistics.                          |
+| `agentgrid federation`        | Show the federated view across peer coordinators.      |
 | `agentgrid adapters`          | Show which agent adapters are installed locally.       |
 
 Configuration lives in `~/.agentgrid/config.json` and can be overridden with
@@ -195,16 +215,19 @@ docs/            architecture, protocol, trust & security
 
 **Shipped in 0.2:** token-usage verification, worker sandboxing
 (`none` / `restricted` / `container`), worker self-pricing with cheapest-wins
-bidding, and a reputation system.
+bidding, reputation.
+
+**Shipped in 0.3:** provider attestation records, structural result
+verification, buyer acceptance window with disputes & admin arbitration,
+worker concurrency (`--capacity`), and the federated multi-coordinator view
+(`agentgrid federation`, `coordinator --peers`).
 
 Still ahead:
 
-- **Provider-side usage attestation** — verify token counts against the
-  provider's own dashboard/API, not just plausibility bounds.
-- **Streaming results** and richer multi-file / multi-directory workspaces.
-- **Disputes & arbitration** — let a buyer contest a result after settlement.
-- **Worker capacity > 1** — run several jobs per worker concurrently.
-- **Federation** — multiple coordinators sharing a worker pool.
+- **Provider-signed usage receipts** — cryptographic attestation once providers
+  expose it; today attestation is an auditable digest plus plausibility bounds.
+- **Streaming results** and richer multi-directory workspaces.
+- **Cross-coordinator job forwarding** with cross-ledger settlement.
 
 ## Contributing
 

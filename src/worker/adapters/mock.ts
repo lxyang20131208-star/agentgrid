@@ -9,7 +9,13 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { estimateTokens } from './exec.js';
 import { DEFAULT_TOKEN_RATES, estimateCostUsd } from '../../shared/pricing.js';
-import { makeUsage, type AgentAdapter, type ExecuteContext, type ExecuteResult } from './types.js';
+import {
+  makeAttestation,
+  makeUsage,
+  type AgentAdapter,
+  type ExecuteContext,
+  type ExecuteResult,
+} from './types.js';
 
 export class MockAdapter implements AgentAdapter {
   readonly name = 'mock' as const;
@@ -42,6 +48,12 @@ export class MockAdapter implements AgentAdapter {
     return {
       resultText,
       tokenUsage: makeUsage({ inputTokens, outputTokens, costUsd, estimated: true }),
+      attestation: makeAttestation({
+        provider: 'mock',
+        model: 'mock-1',
+        providerReportedCost: false,
+        rawResponse: resultText,
+      }),
     };
   }
 }

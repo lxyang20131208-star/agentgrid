@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS workers (
   flagged_reports  INTEGER NOT NULL DEFAULT 0,
   credits_earned   INTEGER NOT NULL DEFAULT 0,
   price_multiplier REAL NOT NULL DEFAULT 1.0,
+  capacity         INTEGER NOT NULL DEFAULT 1,
   last_seen        INTEGER NOT NULL,
   created_at       INTEGER NOT NULL
 );
@@ -55,6 +56,11 @@ CREATE TABLE IF NOT EXISTS jobs (
   cost_credits  INTEGER,
   verification  TEXT,
   max_price_multiplier REAL,
+  attestation   TEXT,
+  result_check  TEXT,
+  settlement    TEXT,
+  delivered_at  INTEGER,
+  resolution    TEXT,
   error         TEXT,
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL
@@ -107,6 +113,7 @@ interface WorkerRow {
   flagged_reports: number;
   credits_earned: number;
   price_multiplier: number;
+  capacity: number;
   last_seen: number;
   created_at: number;
 }
@@ -126,6 +133,11 @@ interface JobRow {
   cost_credits: number | null;
   verification: string | null;
   max_price_multiplier: number | null;
+  attestation: string | null;
+  result_check: string | null;
+  settlement: string | null;
+  delivered_at: number | null;
+  resolution: string | null;
   error: string | null;
   created_at: number;
   updated_at: number;
@@ -159,6 +171,7 @@ function rowToWorker(r: WorkerRow): WorkerInfo {
     flaggedReports: r.flagged_reports,
     creditsEarned: r.credits_earned,
     priceMultiplier: r.price_multiplier,
+    capacity: r.capacity,
     lastSeen: r.last_seen,
   };
 }
@@ -181,6 +194,17 @@ function rowToJob(r: JobRow): Job {
     verification: r.verification
       ? (JSON.parse(r.verification) as Job['verification'])
       : null,
+    attestation: r.attestation
+      ? (JSON.parse(r.attestation) as Job['attestation'])
+      : null,
+    resultCheck: r.result_check
+      ? (JSON.parse(r.result_check) as Job['resultCheck'])
+      : null,
+    settlement: r.settlement
+      ? (JSON.parse(r.settlement) as Job['settlement'])
+      : null,
+    deliveredAt: r.delivered_at,
+    resolution: (r.resolution as Job['resolution']) ?? null,
     error: r.error,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -210,6 +234,12 @@ export class AgentGridDB {
     this.addColumnIfMissing('workers', 'price_multiplier', 'REAL NOT NULL DEFAULT 1.0');
     this.addColumnIfMissing('jobs', 'verification', 'TEXT');
     this.addColumnIfMissing('jobs', 'max_price_multiplier', 'REAL');
+    this.addColumnIfMissing('workers', 'capacity', 'INTEGER NOT NULL DEFAULT 1');
+    this.addColumnIfMissing('jobs', 'attestation', 'TEXT');
+    this.addColumnIfMissing('jobs', 'result_check', 'TEXT');
+    this.addColumnIfMissing('jobs', 'settlement', 'TEXT');
+    this.addColumnIfMissing('jobs', 'delivered_at', 'INTEGER');
+    this.addColumnIfMissing('jobs', 'resolution', 'TEXT');
   }
 
   private addColumnIfMissing(table: string, column: string, definition: string): void {
@@ -272,6 +302,7 @@ export class AgentGridDB {
     name: string,
     adapters: AdapterName[],
     priceMultiplier: number,
+    capacity: number,
   ): WorkerInfo {
     // One worker row per (user, name) pair; re-registering reuses it so
     // lifetime stats and reputation survive reconnects.
@@ -285,20 +316,31 @@ export class AgentGridDB {
       this.raw
         .prepare(
           `UPDATE workers
-           SET adapters = ?, status = 'idle', price_multiplier = ?, last_seen = ?
+           SET adapters = ?, status = 'idle', price_multiplier = ?,
+               capacity = ?, last_seen = ?
            WHERE id = ?`,
         )
-        .run(JSON.stringify(adapters), priceMultiplier, now, id);
+        .run(JSON.stringify(adapters), priceMultiplier, capacity, now, id);
     } else {
       id = `wrk_${randomUUID()}`;
       this.raw
         .prepare(
           `INSERT INTO workers
              (id, user_id, name, adapters, status, jobs_completed, jobs_failed,
-              flagged_reports, credits_earned, price_multiplier, last_seen, created_at)
-           VALUES (?, ?, ?, ?, 'idle', 0, 0, 0, 0, ?, ?, ?)`,
+              flagged_reports, credits_earned, price_multiplier, capacity,
+              last_seen, created_at)
+           VALUES (?, ?, ?, ?, 'idle', 0, 0, 0, 0, ?, ?, ?, ?)`,
         )
-        .run(id, userId, name, JSON.stringify(adapters), priceMultiplier, now, now);
+        .run(
+          id,
+          userId,
+          name,
+          JSON.stringify(adapters),
+          priceMultiplier,
+          capacity,
+          now,
+          now,
+        );
     }
     return rowToWorker(
       this.raw.prepare('SELECT * FROM workers WHERE id = ?').get(id) as WorkerRow,
@@ -400,7 +442,9 @@ export class AgentGridDB {
       .prepare(
         `UPDATE jobs SET
            worker_id = ?, status = ?, result_text = ?, output_files = ?,
-           token_usage = ?, cost_credits = ?, verification = ?, error = ?, updated_at = ?
+           token_usage = ?, cost_credits = ?, verification = ?, attestation = ?,
+           result_check = ?, settlement = ?, delivered_at = ?, resolution = ?,
+           error = ?, updated_at = ?
          WHERE id = ?`,
       )
       .run(
@@ -411,6 +455,11 @@ export class AgentGridDB {
         next.tokenUsage ? JSON.stringify(next.tokenUsage) : null,
         next.costCredits,
         next.verification ? JSON.stringify(next.verification) : null,
+        next.attestation ? JSON.stringify(next.attestation) : null,
+        next.resultCheck ? JSON.stringify(next.resultCheck) : null,
+        next.settlement ? JSON.stringify(next.settlement) : null,
+        next.deliveredAt,
+        next.resolution,
         next.error,
         next.updatedAt,
         id,

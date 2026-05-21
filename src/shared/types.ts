@@ -35,9 +35,51 @@ export type JobStatus =
   | 'queued'
   | 'assigned'
   | 'running'
+  /** Result is in and result-checked; in the buyer acceptance window. */
+  | 'delivered'
+  /** The buyer contested the delivered result; awaiting arbitration. */
+  | 'disputed'
   | 'completed'
   | 'failed'
   | 'cancelled';
+
+/**
+ * A record of where a job's token figures came from. Captured by the worker's
+ * adapter and stored immutably with the job so metering is auditable.
+ */
+export interface Attestation {
+  /** The upstream provider, e.g. "anthropic", "openai", "mock". */
+  provider: string;
+  /** The model id, when the provider reports one. */
+  model: string | null;
+  /** True when the cost figure originated from the provider's own response. */
+  providerReportedCost: boolean;
+  /** SHA-256 of the raw provider response the usage was parsed from. */
+  rawResponseDigest: string;
+}
+
+/** Outcome of the coordinator's structural check of a job result. */
+export interface ResultCheck {
+  ok: boolean;
+  reasons: string[];
+}
+
+/** How an arbitration was resolved. */
+export type Resolution = 'worker' | 'buyer';
+
+/** The credit split for a settled job. See pricing.computeSettlement. */
+export interface Settlement {
+  /** Credits charged to the buyer (<= escrowed). */
+  charged: number;
+  /** Credits paid to the worker. */
+  workerEarned: number;
+  /** Credits taken as platform fee. */
+  platformFee: number;
+  /** Credits returned to the buyer from the escrow remainder. */
+  refunded: number;
+  /** True when the job hit its budget cap. */
+  cappedByBudget: boolean;
+}
 
 /** What a buyer asks the network to do. */
 export interface JobSpec {
@@ -76,6 +118,16 @@ export interface Job extends JobSpec {
   costCredits: number | null;
   /** Outcome of token-usage verification, set when the job completes. */
   verification: JobVerification | null;
+  /** Where the token figures came from — set when a result arrives. */
+  attestation: Attestation | null;
+  /** Outcome of the structural result check — set when a result arrives. */
+  resultCheck: ResultCheck | null;
+  /** Computed credit split, held while a delivered job awaits acceptance. */
+  settlement: Settlement | null;
+  /** When the result was delivered (start of the acceptance window). */
+  deliveredAt: number | null;
+  /** Set when a disputed job is arbitrated. */
+  resolution: Resolution | null;
   error: string | null;
   createdAt: number;
   updatedAt: number;
@@ -99,6 +151,8 @@ export interface WorkerInfo {
   creditsEarned: number;
   /** The worker's price: buyers are charged measuredCost * priceMultiplier. */
   priceMultiplier: number;
+  /** Maximum jobs this worker runs concurrently. */
+  capacity: number;
   lastSeen: number;
 }
 
@@ -112,6 +166,9 @@ export interface PublicWorker {
   /** Computed 0-100 reputation score. */
   reputation: number;
   priceMultiplier: number;
+  capacity: number;
+  /** Jobs the worker is running right now. */
+  activeJobs: number;
   lastSeen: number;
 }
 

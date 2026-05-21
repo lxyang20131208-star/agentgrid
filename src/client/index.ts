@@ -7,7 +7,13 @@ import type {
   JobSpec,
   NetworkStats,
   PublicWorker,
+  Resolution,
 } from '../shared/types.js';
+
+export interface FederationView {
+  coordinators: { url: string; online: boolean; stats: NetworkStats | null }[];
+  aggregate: NetworkStats;
+}
 
 export interface RegisterResult {
   userId: string;
@@ -42,9 +48,11 @@ export class CoordinatorClient {
     method: string,
     path: string,
     body?: unknown,
+    authToken?: string,
   ): Promise<T> {
     const headers: Record<string, string> = { accept: 'application/json' };
-    if (this.apiKey) headers['authorization'] = `Bearer ${this.apiKey}`;
+    const token = authToken ?? this.apiKey;
+    if (token) headers['authorization'] = `Bearer ${token}`;
     if (body !== undefined) headers['content-type'] = 'application/json';
 
     let res: Response;
@@ -110,13 +118,41 @@ export class CoordinatorClient {
     return this.request('GET', '/v1/stats');
   }
 
-  /** Poll a job until it reaches a terminal state or the timeout elapses. */
+  federation(): Promise<FederationView> {
+    return this.request('GET', '/v1/federation');
+  }
+
+  /** Accept a delivered job — pays the worker immediately. */
+  acceptJob(id: string): Promise<{ job: Job }> {
+    return this.request('POST', `/v1/jobs/${id}/accept`, {});
+  }
+
+  /** Dispute a delivered job — holds payment for arbitration. */
+  disputeJob(id: string): Promise<{ job: Job }> {
+    return this.request('POST', `/v1/jobs/${id}/dispute`, {});
+  }
+
+  /** Arbitrate a disputed job. Requires the coordinator admin key. */
+  resolveJob(
+    id: string,
+    ruling: Resolution,
+    adminKey: string,
+  ): Promise<{ job: Job }> {
+    return this.request('POST', `/v1/jobs/${id}/resolve`, { ruling }, adminKey);
+  }
+
+  /**
+   * Poll a job until it reaches a terminal state or the timeout elapses.
+   * 'delivered' counts as terminal — the result is available even though the
+   * acceptance window has not closed.
+   */
   async waitForJob(id: string, timeoutMs = 15 * 60_000): Promise<Job> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const { job } = await this.getJob(id);
       if (
         job.status === 'completed' ||
+        job.status === 'delivered' ||
         job.status === 'failed' ||
         job.status === 'cancelled'
       ) {

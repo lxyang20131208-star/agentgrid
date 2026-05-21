@@ -6,7 +6,13 @@
 // rather than estimated.
 
 import { commandExists } from './exec.js';
-import { makeUsage, type AgentAdapter, type ExecuteContext, type ExecuteResult } from './types.js';
+import {
+  makeAttestation,
+  makeUsage,
+  type AgentAdapter,
+  type ExecuteContext,
+  type ExecuteResult,
+} from './types.js';
 
 /** Shape of the JSON object emitted by `claude -p --output-format json`. */
 interface ClaudeResultJson {
@@ -14,6 +20,7 @@ interface ClaudeResultJson {
   subtype?: string;
   is_error?: boolean;
   result?: string;
+  model?: string;
   total_cost_usd?: number;
   usage?: {
     input_tokens?: number;
@@ -70,6 +77,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
     const cacheReadInputTokens = u.cache_read_input_tokens ?? 0;
 
     ctx.onProgress('claude-code: complete');
+    const providerReportedCost = parsed.total_cost_usd !== undefined;
     return {
       resultText: parsed.result ?? '',
       tokenUsage: makeUsage({
@@ -79,7 +87,13 @@ export class ClaudeCodeAdapter implements AgentAdapter {
         cacheReadInputTokens,
         // Claude Code reports its own cost — trust it, don't estimate.
         costUsd: parsed.total_cost_usd ?? 0,
-        estimated: parsed.total_cost_usd === undefined,
+        estimated: !providerReportedCost,
+      }),
+      attestation: makeAttestation({
+        provider: 'anthropic',
+        model: parsed.model ?? null,
+        providerReportedCost,
+        rawResponse: res.stdout,
       }),
     };
   }

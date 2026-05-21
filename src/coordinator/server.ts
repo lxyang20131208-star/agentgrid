@@ -10,7 +10,7 @@ import { ADAPTER, JOB_FILE } from '../shared/protocol.js';
 import { InsufficientCreditsError } from './ledger.js';
 import type { Coordinator } from './index.js';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 
 const JOB_SUBMIT = z.object({
   adapter: ADAPTER,
@@ -23,6 +23,10 @@ const JOB_SUBMIT = z.object({
 
 const REGISTER = z.object({
   email: z.string().email().max(254),
+});
+
+const RESOLVE = z.object({
+  ruling: z.enum(['worker', 'buyer']),
 });
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -74,6 +78,31 @@ export function createHttpHandler(coord: Coordinator) {
 
       if (method === 'GET' && path === '/v1/workers') {
         return sendJson(res, 200, { workers: coord.listPublicWorkers() });
+      }
+
+      if (method === 'GET' && path === '/v1/federation') {
+        return sendJson(res, 200, await coord.getFederation());
+      }
+
+      // Arbitration — authenticated with the coordinator admin key, not a
+      // user API key, so it is handled before the user-auth gate below.
+      const resolveMatch = path.match(/^\/v1\/jobs\/([\w-]+)\/resolve$/);
+      if (method === 'POST' && resolveMatch) {
+        if (!coord.authenticateAdmin(bearerToken(req))) {
+          return sendJson(res, 401, { error: 'admin key required' });
+        }
+        const parsed = RESOLVE.safeParse(await readJsonBody(req));
+        if (!parsed.success) {
+          return sendJson(res, 400, { error: 'ruling must be "worker" or "buyer"' });
+        }
+        try {
+          const job = coord.resolveJob(resolveMatch[1]!, parsed.data.ruling);
+          return sendJson(res, 200, { job });
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err instanceof Error ? err.message : 'resolve failed',
+          });
+        }
       }
 
       if (method === 'POST' && path === '/v1/register') {
@@ -150,6 +179,28 @@ export function createHttpHandler(coord: Coordinator) {
           return sendJson(res, 404, { error: 'job not found' });
         }
         return sendJson(res, 200, { job });
+      }
+
+      const acceptMatch = path.match(/^\/v1\/jobs\/([\w-]+)\/accept$/);
+      if (method === 'POST' && acceptMatch && user) {
+        try {
+          return sendJson(res, 200, { job: coord.acceptJob(user.id, acceptMatch[1]!) });
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err instanceof Error ? err.message : 'accept failed',
+          });
+        }
+      }
+
+      const disputeMatch = path.match(/^\/v1\/jobs\/([\w-]+)\/dispute$/);
+      if (method === 'POST' && disputeMatch && user) {
+        try {
+          return sendJson(res, 200, { job: coord.disputeJob(user.id, disputeMatch[1]!) });
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err instanceof Error ? err.message : 'dispute failed',
+          });
+        }
       }
 
       return sendJson(res, 404, { error: 'not found' });

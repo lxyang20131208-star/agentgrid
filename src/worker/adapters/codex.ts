@@ -10,7 +10,13 @@
 
 import { commandExists, estimateTokens } from './exec.js';
 import { DEFAULT_TOKEN_RATES, estimateCostUsd } from '../../shared/pricing.js';
-import { makeUsage, type AgentAdapter, type ExecuteContext, type ExecuteResult } from './types.js';
+import {
+  makeAttestation,
+  makeUsage,
+  type AgentAdapter,
+  type ExecuteContext,
+  type ExecuteResult,
+} from './types.js';
 
 interface ParsedUsage {
   inputTokens: number;
@@ -98,6 +104,13 @@ export class CodexAdapter implements AgentAdapter {
     return {
       resultText,
       tokenUsage: makeUsage({ inputTokens, outputTokens, costUsd, estimated }),
+      attestation: makeAttestation({
+        provider: 'openai',
+        model: null,
+        // Codex does not report a dollar cost — AgentGrid estimates it.
+        providerReportedCost: false,
+        rawResponse: res.stdout,
+      }),
     };
   }
 }

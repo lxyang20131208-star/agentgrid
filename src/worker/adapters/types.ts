@@ -1,7 +1,8 @@
 // The adapter contract. Each supported agent backend (Claude Code, Codex, the
 // mock) implements this so the runner can treat them uniformly.
 
-import type { AdapterName, TokenUsage } from '../../shared/types.js';
+import { createHash } from 'node:crypto';
+import type { AdapterName, Attestation, TokenUsage } from '../../shared/types.js';
 import type { RunResult } from './exec.js';
 
 /**
@@ -35,6 +36,8 @@ export interface ExecuteResult {
   resultText: string;
   /** Measured (or estimated) token + cost accounting. */
   tokenUsage: TokenUsage;
+  /** Where the token figures came from — recorded for auditability. */
+  attestation: Attestation;
 }
 
 export interface AgentAdapter {
@@ -43,6 +46,27 @@ export interface AgentAdapter {
   isAvailable(): Promise<boolean>;
   /** Run one job to completion. */
   execute(ctx: ExecuteContext): Promise<ExecuteResult>;
+}
+
+/**
+ * Build an attestation. The raw provider response is digested (SHA-256) so the
+ * coordinator can store a fingerprint of exactly what the usage was parsed
+ * from, without storing the whole response.
+ */
+export function makeAttestation(opts: {
+  provider: string;
+  model: string | null;
+  providerReportedCost: boolean;
+  rawResponse: string;
+}): Attestation {
+  return {
+    provider: opts.provider,
+    model: opts.model,
+    providerReportedCost: opts.providerReportedCost,
+    rawResponseDigest: createHash('sha256')
+      .update(opts.rawResponse)
+      .digest('hex'),
+  };
 }
 
 /** Build a fully-populated TokenUsage, filling defaults for missing fields. */

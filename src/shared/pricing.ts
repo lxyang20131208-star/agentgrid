@@ -4,7 +4,9 @@
 // fixed fraction of a US dollar so that "spend" and "earn" are symmetric and
 // comparable across providers.
 
-import type { AdapterName, TokenUsage } from './types.js';
+import type { AdapterName, Settlement, TokenUsage } from './types.js';
+
+export type { Settlement } from './types.js';
 
 /** 1 credit == USD_PER_CREDIT dollars. $1 == 10,000 credits. */
 export const USD_PER_CREDIT = 0.0001;
@@ -64,19 +66,6 @@ export function usageToCredits(usage: TokenUsage): number {
  * The worker receives that amount minus the platform fee. Any unspent budget
  * is refunded to the buyer.
  */
-export interface Settlement {
-  /** Credits charged to the buyer (<= escrowed). */
-  charged: number;
-  /** Credits paid to the worker. */
-  workerEarned: number;
-  /** Credits taken as platform fee. */
-  platformFee: number;
-  /** Credits returned to the buyer from the escrow remainder. */
-  refunded: number;
-  /** True when the job hit its budget cap. */
-  cappedByBudget: boolean;
-}
-
 export function computeSettlement(
   measuredCredits: number,
   escrowedCredits: number,

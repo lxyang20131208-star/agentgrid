@@ -21,7 +21,7 @@ test('a job is routed to the cheaper of two competing workers', async () => {
   const sellerB = coordinator.register('cheap@example.com');
 
   const expensive = new Worker({
-    coordinatorUrl: coordinator.url,
+    coordinatorUrls: [coordinator.url],
     apiKey: sellerA.apiKey,
     name: 'expensive-worker',
     adapters: ['mock'],
@@ -30,7 +30,7 @@ test('a job is routed to the cheaper of two competing workers', async () => {
     autoReconnect: false,
   });
   const cheap = new Worker({
-    coordinatorUrl: coordinator.url,
+    coordinatorUrls: [coordinator.url],
     apiKey: sellerB.apiKey,
     name: 'cheap-worker',
     adapters: ['mock'],
@@ -80,7 +80,7 @@ test('maxPriceMultiplier keeps a job away from an over-priced worker', async () 
   const seller = coordinator.register('pricey@example.com');
 
   const pricey = new Worker({
-    coordinatorUrl: coordinator.url,
+    coordinatorUrls: [coordinator.url],
     apiKey: seller.apiKey,
     name: 'pricey-worker',
     adapters: ['mock'],

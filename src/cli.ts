@@ -17,7 +17,7 @@ import {
   DEFAULT_SIGNUP_GRANT,
   creditsToUsd,
 } from './shared/pricing.js';
-import type { AdapterName, JobFile } from './shared/types.js';
+import type { AdapterName, Job, JobFile } from './shared/types.js';
 import { Coordinator } from './coordinator/index.js';
 import { Worker, probeAdapters } from './worker/index.js';
 import { CoordinatorClient, ApiError } from './client/index.js';
@@ -26,7 +26,7 @@ const program = new Command();
 program
   .name('agentgrid')
   .description('A peer-to-peer grid for renting and sharing AI agent compute.')
-  .version('0.2.0');
+  .version('0.3.0');
 
 // --- coordinator -----------------------------------------------------------
 
@@ -37,6 +37,9 @@ program
   .option('--db <path>', 'SQLite database file', process.env.AGENTGRID_DB ?? 'agentgrid.sqlite')
   .option('--signup-grant <credits>', 'credits granted to each new account')
   .option('--platform-fee <fraction>', 'fee fraction taken per settled job')
+  .option('--acceptance-window <ms>', 'buyer acceptance window in ms (0 disables disputes)')
+  .option('--admin-key <key>', 'admin key for arbitration (generated if omitted)')
+  .option('--peers <list>', 'comma-separated peer coordinator URLs for the federated view')
   .action(async (opts) => {
     const coordinator = new Coordinator({
       port: Number(opts.port),
@@ -47,6 +50,14 @@ program
       platformFee: opts.platformFee
         ? Number(opts.platformFee)
         : Number(process.env.AGENTGRID_PLATFORM_FEE ?? DEFAULT_PLATFORM_FEE),
+      acceptanceWindowMs: Number(
+        opts.acceptanceWindow ?? process.env.AGENTGRID_ACCEPTANCE_WINDOW ?? 0,
+      ),
+      adminKey: opts.adminKey ?? process.env.AGENTGRID_ADMIN_KEY,
+      peers: (opts.peers ?? process.env.AGENTGRID_PEERS ?? '')
+        .split(',')
+        .map((s: string) => s.trim())
+        .filter(Boolean),
     });
     await coordinator.start();
     console.log(`AgentGrid coordinator running. Database: ${opts.db}`);
@@ -99,10 +110,15 @@ program
   .option('--container-memory <mem>', 'memory limit for container sandbox', '2g')
   .option('--container-cpus <cpus>', 'cpu limit for container sandbox', '2')
   .option('--container-network <net>', 'docker network for container sandbox', 'bridge')
-  .option('-u, --url <url>', 'coordinator URL')
+  .option('-c, --capacity <n>', 'max jobs to run concurrently', '1')
+  .option('-u, --url <urls>', 'coordinator URL(s), comma-separated for multi-homing')
   .action(async (opts) => {
     const config = loadConfig();
-    const url = opts.url ?? config.coordinatorUrl;
+    const urlArg = opts.url ?? config.coordinatorUrl;
+    const coordinatorUrls = String(urlArg)
+      .split(',')
+      .map((s: string) => s.trim())
+      .filter(Boolean);
     if (!config.apiKey) fail(new Error('not registered — run `agentgrid register` first'));
 
     const adapters = opts.adapters
@@ -110,12 +126,13 @@ program
       : undefined;
 
     const worker = new Worker({
-      coordinatorUrl: url,
+      coordinatorUrls,
       apiKey: config.apiKey!,
       name: opts.name,
       adapters,
       permissionMode: opts.permissionMode,
       priceMultiplier: Number(opts.price),
+      capacity: Number(opts.capacity),
       sandbox: {
         mode: opts.sandbox,
         containerImage: opts.containerImage,
@@ -258,8 +275,8 @@ program
       for (const w of workers) {
         console.log(
           `${w.name.padEnd(18)}  ${w.status.padEnd(8)}  rep ${String(w.reputation).padStart(3)}  ` +
-            `${String(w.priceMultiplier).padStart(5)}x  ${w.adapters.join(',').padEnd(22)}  ` +
-            `${w.jobsCompleted}✓ ${w.jobsFailed}✗`,
+            `${String(w.priceMultiplier).padStart(5)}x  ${w.activeJobs}/${w.capacity}  ` +
+            `${w.adapters.join(',').padEnd(20)}  ${w.jobsCompleted}✓ ${w.jobsFailed}✗`,
         );
       }
     } catch (err) {
@@ -284,6 +301,87 @@ program
       console.log(`Jobs completed:       ${s.jobsCompleted}`);
       console.log(`Credits in circulation: ${s.creditsInCirculation}`);
       console.log(`Tokens metered:       ${s.totalTokensMetered}`);
+    } catch (err) {
+      fail(err);
+    }
+  });
+
+// --- accept / dispute ------------------------------------------------------
+
+program
+  .command('accept')
+  .description('Accept a delivered job — pays the worker immediately.')
+  .argument('<jobId>', 'the job id')
+  .action(async (jobId: string) => {
+    const config = loadConfig();
+    if (!config.apiKey) fail(new Error('not registered — run `agentgrid register` first'));
+    const client = new CoordinatorClient(config.coordinatorUrl, config.apiKey);
+    try {
+      const { job } = await client.acceptJob(jobId);
+      console.log(`Job ${job.id} accepted — status: ${job.status}`);
+    } catch (err) {
+      fail(err);
+    }
+  });
+
+program
+  .command('dispute')
+  .description('Dispute a delivered job — holds payment for arbitration.')
+  .argument('<jobId>', 'the job id')
+  .action(async (jobId: string) => {
+    const config = loadConfig();
+    if (!config.apiKey) fail(new Error('not registered — run `agentgrid register` first'));
+    const client = new CoordinatorClient(config.coordinatorUrl, config.apiKey);
+    try {
+      const { job } = await client.disputeJob(jobId);
+      console.log(`Job ${job.id} disputed — status: ${job.status}. Awaiting arbitration.`);
+    } catch (err) {
+      fail(err);
+    }
+  });
+
+program
+  .command('resolve')
+  .description('Arbitrate a disputed job (coordinator admin only).')
+  .argument('<jobId>', 'the job id')
+  .argument('<ruling>', 'who wins the dispute: worker or buyer')
+  .requiredOption('--admin-key <key>', 'the coordinator admin key')
+  .action(async (jobId: string, ruling: string, opts) => {
+    if (ruling !== 'worker' && ruling !== 'buyer') {
+      fail(new Error('ruling must be "worker" or "buyer"'));
+    }
+    const config = loadConfig();
+    const client = new CoordinatorClient(config.coordinatorUrl);
+    try {
+      const { job } = await client.resolveJob(jobId, ruling, opts.adminKey);
+      console.log(`Job ${job.id} resolved in favour of the ${job.resolution} — status: ${job.status}`);
+    } catch (err) {
+      fail(err);
+    }
+  });
+
+// --- federation ------------------------------------------------------------
+
+program
+  .command('federation')
+  .description('Show the federated view across this coordinator and its peers.')
+  .action(async () => {
+    const config = loadConfig();
+    const client = new CoordinatorClient(config.coordinatorUrl);
+    try {
+      const fed = await client.federation();
+      for (const c of fed.coordinators) {
+        const tag = c.online ? 'online ' : 'OFFLINE';
+        const detail = c.stats
+          ? `${c.stats.workersOnline}/${c.stats.workers} workers · ${c.stats.jobsCompleted} jobs done`
+          : '(unreachable)';
+        console.log(`${tag}  ${c.url}  —  ${detail}`);
+      }
+      const a = fed.aggregate;
+      console.log(
+        `\nFederation total: ${a.workers} workers, ${a.jobsCompleted} jobs completed, ` +
+          `${a.creditsInCirculation} credits in circulation`,
+      );
     } catch (err) {
       fail(err);
     }
@@ -317,17 +415,7 @@ function readStdin(): string {
   }
 }
 
-function printJob(job: {
-  id: string;
-  status: string;
-  adapter: string;
-  costCredits: number | null;
-  resultText: string | null;
-  error: string | null;
-  tokenUsage: { totalTokens: number; costUsd: number; estimated: boolean } | null;
-  verification: { ok: boolean; reasons: string[]; verifiedCostUsd: number } | null;
-  outputFiles: JobFile[] | null;
-}): void {
+function printJob(job: Job): void {
   console.log(`Job ${job.id}`);
   console.log(`  Status:  ${job.status}`);
   console.log(`  Adapter: ${job.adapter}`);
@@ -337,12 +425,20 @@ function printJob(job: {
       `  Tokens:  ${job.tokenUsage.totalTokens}  ($${job.tokenUsage.costUsd.toFixed(4)}${tag})`,
     );
   }
+  if (job.attestation) {
+    const src = job.attestation.providerReportedCost ? 'provider-attested' : 'estimated';
+    console.log(`  Source:  ${job.attestation.provider} (${src})`);
+  }
   if (job.costCredits !== null) console.log(`  Charged: ${job.costCredits} credits`);
   if (job.verification && !job.verification.ok) {
     console.log(`  Usage:   ⚠ flagged — ${job.verification.reasons.join('; ')}`);
   } else if (job.verification) {
     console.log('  Usage:   ✓ verified');
   }
+  if (job.resultCheck && !job.resultCheck.ok) {
+    console.log(`  Result:  ⚠ ${job.resultCheck.reasons.join('; ')}`);
+  }
+  if (job.resolution) console.log(`  Dispute: resolved for the ${job.resolution}`);
   if (job.error) console.log(`  Error:   ${job.error}`);
   if (job.resultText) {
     console.log('  --- result ---');

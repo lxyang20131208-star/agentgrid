@@ -1,6 +1,6 @@
 {
   "name": "agentgrid",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A peer-to-peer grid for renting and sharing AI agent compute. Lend your spare Claude Code / Codex capacity and earn credits; spend credits to have other people's agents run your tasks.",
   "type": "module",
   "license": "MIT",

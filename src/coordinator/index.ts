@@ -1,5 +1,5 @@
 // The coordinator: the broker that matches buyers' jobs to workers, runs the
-// credit ledger, and settles payment when a job completes.
+// credit ledger, verifies results and settles payment.
 //
 // It exposes an HTTP REST API for clients (see server.ts) and a WebSocket
 // endpoint at /v1/worker for worker daemons.
@@ -19,14 +19,18 @@ import {
 } from '../shared/protocol.js';
 import { reputationScore } from '../shared/reputation.js';
 import { verifyUsage } from '../shared/verification.js';
+import { checkResult, isResultUsable } from '../shared/result-check.js';
 import type {
   AccountInfo,
   AdapterName,
+  Attestation,
   Job,
   JobFile,
   JobSpec,
   NetworkStats,
   PublicWorker,
+  Resolution,
+  Settlement,
   TokenUsage,
 } from '../shared/types.js';
 import { AgentGridDB, type User } from './db.js';
@@ -42,6 +46,16 @@ export interface CoordinatorOptions {
   signupGrant?: number;
   /** Platform fee fraction taken from each settled job. */
   platformFee?: number;
+  /**
+   * How long a buyer may accept or dispute a delivered job before it auto-
+   * settles, in milliseconds. 0 (the default) settles immediately on result
+   * and disables disputes.
+   */
+  acceptanceWindowMs?: number;
+  /** Admin key for arbitration. Generated and logged if omitted. */
+  adminKey?: string;
+  /** Peer coordinator URLs for the federated view. */
+  peers?: string[];
   /** Suppress console logging (used by tests). */
   quiet?: boolean;
 }
@@ -56,18 +70,13 @@ interface LiveWorker {
   userId: string;
   ws: WebSocket;
   adapters: AdapterName[];
-  /** The worker's advertised price: buyers pay measuredCost * this. */
   priceMultiplier: number;
-  state: 'idle' | 'offered' | 'busy';
-  jobId: string | null;
+  capacity: number;
+  /** Job ids currently offered to or running on this worker. */
+  jobs: Set<string>;
 }
 
-interface Offer {
-  workerId: string;
-  expiresAt: number;
-}
-
-interface RunningJob {
+interface Pending {
   workerId: string;
   expiresAt: number;
 }
@@ -77,20 +86,19 @@ export class Coordinator {
   private readonly ledger: Ledger;
   private readonly signupGrant: number;
   private readonly platformFee: number;
+  private readonly acceptanceWindowMs: number;
+  private readonly peers: string[];
   private readonly quiet: boolean;
   private readonly desiredPort: number;
+  readonly adminKey: string;
 
   private http: Server | null = null;
   private wss: WebSocketServer | null = null;
   private sweepTimer: NodeJS.Timeout | null = null;
 
-  /** workerId -> live connection state. */
   private readonly live = new Map<string, LiveWorker>();
-  /** jobId -> outstanding offer. */
-  private readonly offers = new Map<string, Offer>();
-  /** jobId -> running job tracking. */
-  private readonly running = new Map<string, RunningJob>();
-  /** "<jobId>|<workerId>" pairs a worker has declined or timed out on. */
+  private readonly offers = new Map<string, Pending>();
+  private readonly running = new Map<string, Pending>();
   private readonly declined = new Set<string>();
 
   constructor(opts: CoordinatorOptions = {}) {
@@ -98,8 +106,11 @@ export class Coordinator {
     this.ledger = new Ledger(this.db.raw);
     this.signupGrant = opts.signupGrant ?? DEFAULT_SIGNUP_GRANT;
     this.platformFee = opts.platformFee ?? DEFAULT_PLATFORM_FEE;
+    this.acceptanceWindowMs = Math.max(0, opts.acceptanceWindowMs ?? 0);
+    this.peers = opts.peers ?? [];
     this.quiet = opts.quiet ?? false;
     this.desiredPort = opts.port ?? 7420;
+    this.adminKey = opts.adminKey ?? `ag_admin_${randomBytes(18).toString('hex')}`;
   }
 
   // --- Lifecycle -----------------------------------------------------------
@@ -136,18 +147,17 @@ export class Coordinator {
     this.sweepTimer = setInterval(() => this.sweep(), 2_000);
     this.sweepTimer.unref();
     this.log(`coordinator listening on ${this.url}`);
+    if (this.acceptanceWindowMs > 0) {
+      this.log(`acceptance window: ${this.acceptanceWindowMs}ms · admin key: ${this.adminKey}`);
+    }
   }
 
   async stop(): Promise<void> {
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     for (const lw of this.live.values()) lw.ws.close();
     this.live.clear();
-    await new Promise<void>((resolve) => {
-      this.wss?.close(() => resolve());
-    });
-    await new Promise<void>((resolve) => {
-      this.http?.close(() => resolve());
-    });
+    await new Promise<void>((resolve) => this.wss?.close(() => resolve()));
+    await new Promise<void>((resolve) => this.http?.close(() => resolve()));
     this.db.close();
   }
 
@@ -178,6 +188,10 @@ export class Coordinator {
     return this.db.getUserByApiKeyHash(hashKey(apiKey));
   }
 
+  authenticateAdmin(key: string | null): boolean {
+    return key !== null && key === this.adminKey;
+  }
+
   getAccountInfo(userId: string): AccountInfo {
     const user = this.db.getUserById(userId);
     if (!user) throw new Error('user not found');
@@ -191,9 +205,8 @@ export class Coordinator {
   }
 
   private escrowedForBuyer(userId: string): number {
-    // Credits the buyer currently has locked across in-flight jobs.
     let total = 0;
-    for (const status of ['queued', 'assigned', 'running'] as const) {
+    for (const status of ['queued', 'assigned', 'running', 'delivered', 'disputed'] as const) {
       for (const job of this.db.listJobsByStatus(status)) {
         if (job.buyerId === userId) total += job.maxCredits;
       }
@@ -201,7 +214,7 @@ export class Coordinator {
     return total;
   }
 
-  // --- Jobs ----------------------------------------------------------------
+  // --- Jobs (buyer side) ---------------------------------------------------
 
   submitJob(buyerId: string, spec: JobSpec): Job {
     const job = this.db.createJob(
@@ -213,7 +226,6 @@ export class Coordinator {
       spec.maxPriceMultiplier ?? null,
     );
     try {
-      // Escrow the full budget up front so the worker is guaranteed payment.
       this.ledger.escrowForJob(job.id, buyerId, spec.maxCredits);
     } catch (err) {
       this.db.updateJob(job.id, { status: 'cancelled', error: 'escrow failed' });
@@ -232,27 +244,78 @@ export class Coordinator {
     return this.db.listJobsByBuyer(buyerId);
   }
 
-  // --- Workers (read) ------------------------------------------------------
-
-  listPublicWorkers(): PublicWorker[] {
-    return this.db.listWorkers().map((w) => ({
-      id: w.id,
-      name: w.name,
-      adapters: w.adapters,
-      status: this.live.has(w.id) ? w.status : 'offline',
-      jobsCompleted: w.jobsCompleted,
-      jobsFailed: w.jobsFailed,
-      reputation: reputationScore({
-        jobsCompleted: w.jobsCompleted,
-        jobsFailed: w.jobsFailed,
-        flaggedReports: w.flaggedReports,
-      }),
-      priceMultiplier: w.priceMultiplier,
-      lastSeen: w.lastSeen,
-    }));
+  /** Buyer accepts a delivered job — the worker is paid immediately. */
+  acceptJob(buyerId: string, jobId: string): Job {
+    const job = this.requireBuyerJob(buyerId, jobId);
+    if (job.status !== 'delivered') {
+      throw new Error(`job is ${job.status}, not awaiting acceptance`);
+    }
+    this.releaseDeliveredJob(job, null);
+    this.log(`job ${jobId} accepted by buyer`);
+    return this.db.getJob(jobId)!;
   }
 
-  /** Current 0-100 reputation score for a worker. */
+  /** Buyer disputes a delivered job — payment is held for arbitration. */
+  disputeJob(buyerId: string, jobId: string): Job {
+    if (this.acceptanceWindowMs === 0) {
+      throw new Error('disputes are disabled (no acceptance window configured)');
+    }
+    const job = this.requireBuyerJob(buyerId, jobId);
+    if (job.status !== 'delivered') {
+      throw new Error(`job is ${job.status}, not awaiting acceptance`);
+    }
+    this.db.updateJob(jobId, { status: 'disputed' });
+    this.log(`job ${jobId} disputed by buyer`);
+    return this.db.getJob(jobId)!;
+  }
+
+  /** Arbitrate a disputed job (admin only). */
+  resolveJob(jobId: string, ruling: Resolution): Job {
+    const job = this.db.getJob(jobId);
+    if (!job) throw new Error('job not found');
+    if (job.status !== 'disputed') {
+      throw new Error(`job is ${job.status}, not disputed`);
+    }
+    if (ruling === 'worker') {
+      this.releaseDeliveredJob(job, 'worker');
+    } else {
+      this.refundDeliveredJob(job);
+    }
+    this.log(`job ${jobId} resolved in favour of the ${ruling}`);
+    return this.db.getJob(jobId)!;
+  }
+
+  private requireBuyerJob(buyerId: string, jobId: string): Job {
+    const job = this.db.getJob(jobId);
+    if (!job || job.buyerId !== buyerId) throw new Error('job not found');
+    return job;
+  }
+
+  // --- Workers / stats / federation ---------------------------------------
+
+  listPublicWorkers(): PublicWorker[] {
+    return this.db.listWorkers().map((w) => {
+      const liveWorker = this.live.get(w.id);
+      return {
+        id: w.id,
+        name: w.name,
+        adapters: w.adapters,
+        status: liveWorker ? (liveWorker.jobs.size > 0 ? 'busy' : 'idle') : 'offline',
+        jobsCompleted: w.jobsCompleted,
+        jobsFailed: w.jobsFailed,
+        reputation: reputationScore({
+          jobsCompleted: w.jobsCompleted,
+          jobsFailed: w.jobsFailed,
+          flaggedReports: w.flaggedReports,
+        }),
+        priceMultiplier: w.priceMultiplier,
+        capacity: w.capacity,
+        activeJobs: liveWorker ? liveWorker.jobs.size : 0,
+        lastSeen: w.lastSeen,
+      };
+    });
+  }
+
   private workerReputation(workerId: string): number {
     const w = this.db.getWorker(workerId);
     if (!w) return 0;
@@ -270,12 +333,63 @@ export class Coordinator {
       workersOnline: this.live.size,
       jobsQueued: this.db.countJobsByStatus('queued'),
       jobsRunning:
-        this.db.countJobsByStatus('assigned') +
-        this.db.countJobsByStatus('running'),
+        this.db.countJobsByStatus('assigned') + this.db.countJobsByStatus('running'),
       jobsCompleted: this.db.countJobsByStatus('completed'),
       creditsInCirculation: this.ledger.creditsInCirculation(),
       totalTokensMetered: this.db.totalTokensMetered(),
     };
+  }
+
+  /**
+   * Aggregate this coordinator with its peers into one federated view. Each
+   * coordinator keeps its own ledger; this is a read-only roll-up.
+   */
+  async getFederation(): Promise<{
+    coordinators: { url: string; online: boolean; stats: NetworkStats | null }[];
+    aggregate: NetworkStats;
+  }> {
+    const local: NetworkStats = this.getStats();
+    const coordinators: { url: string; online: boolean; stats: NetworkStats | null }[] = [
+      { url: this.url, online: true, stats: local },
+    ];
+
+    for (const peer of this.peers) {
+      try {
+        const res = await fetch(`${peer.replace(/\/+$/, '')}/v1/stats`, {
+          signal: AbortSignal.timeout(3_000),
+        });
+        coordinators.push({
+          url: peer,
+          online: res.ok,
+          stats: res.ok ? ((await res.json()) as NetworkStats) : null,
+        });
+      } catch {
+        coordinators.push({ url: peer, online: false, stats: null });
+      }
+    }
+
+    const aggregate: NetworkStats = {
+      users: 0,
+      workers: 0,
+      workersOnline: 0,
+      jobsQueued: 0,
+      jobsRunning: 0,
+      jobsCompleted: 0,
+      creditsInCirculation: 0,
+      totalTokensMetered: 0,
+    };
+    for (const c of coordinators) {
+      if (!c.stats) continue;
+      aggregate.users += c.stats.users;
+      aggregate.workers += c.stats.workers;
+      aggregate.workersOnline += c.stats.workersOnline;
+      aggregate.jobsQueued += c.stats.jobsQueued;
+      aggregate.jobsRunning += c.stats.jobsRunning;
+      aggregate.jobsCompleted += c.stats.jobsCompleted;
+      aggregate.creditsInCirculation += c.stats.creditsInCirculation;
+      aggregate.totalTokensMetered += c.stats.totalTokensMetered;
+    }
+    return { coordinators, aggregate };
   }
 
   // --- Worker WebSocket ----------------------------------------------------
@@ -292,11 +406,13 @@ export class Coordinator {
 
       if (msg.type === 'register') {
         const priceMultiplier = msg.priceMultiplier ?? 1;
+        const capacity = msg.capacity ?? 1;
         const worker = this.db.upsertWorker(
           user.id,
           msg.name,
           msg.adapters,
           priceMultiplier,
+          capacity,
         );
         workerId = worker.id;
         this.live.set(worker.id, {
@@ -305,12 +421,14 @@ export class Coordinator {
           ws,
           adapters: msg.adapters,
           priceMultiplier,
-          state: 'idle',
-          jobId: null,
+          capacity,
+          jobs: new Set(),
         });
         this.db.setWorkerStatus(worker.id, 'idle');
         send(ws, { type: 'registered', workerId: worker.id });
-        this.log(`worker ${worker.name} online (${worker.id}) @ ${priceMultiplier}x`);
+        this.log(
+          `worker ${worker.name} online (${worker.id}) @ ${priceMultiplier}x, capacity ${capacity}`,
+        );
         this.dispatch();
         return;
       }
@@ -323,7 +441,7 @@ export class Coordinator {
 
       switch (msg.type) {
         case 'heartbeat':
-          this.db.setWorkerStatus(lw.workerId, lw.state === 'idle' ? 'idle' : 'busy');
+          this.db.setWorkerStatus(lw.workerId, lw.jobs.size > 0 ? 'busy' : 'idle');
           break;
         case 'job_accept':
           this.onJobAccept(lw, msg.jobId);
@@ -335,7 +453,7 @@ export class Coordinator {
           this.onJobProgress(lw, msg.jobId);
           break;
         case 'job_result':
-          this.onJobResult(lw, msg.jobId, msg.resultText, msg.outputFiles, msg.tokenUsage);
+          this.onJobResult(lw, msg.jobId, msg.resultText, msg.outputFiles, msg.tokenUsage, msg.attestation);
           break;
         case 'job_failed':
           this.onJobFailed(lw, msg.jobId, msg.error);
@@ -358,16 +476,19 @@ export class Coordinator {
     this.db.setWorkerStatus(workerId, 'offline');
     this.log(`worker ${workerId} offline`);
 
-    // Any job this worker held goes back into the queue for someone else.
-    if (lw.jobId) {
-      this.offers.delete(lw.jobId);
-      this.running.delete(lw.jobId);
-      // Abandoning a job mid-flight counts against the worker's reputation.
-      if (lw.state === 'busy') this.db.recordWorkerFailure(workerId);
-      const job = this.db.getJob(lw.jobId);
-      if (job && (job.status === 'queued' || job.status === 'assigned' || job.status === 'running')) {
-        this.db.updateJob(lw.jobId, { status: 'queued', workerId: null });
-        this.log(`job ${lw.jobId} re-queued (worker left)`);
+    // Every job this worker held goes back into the queue for someone else.
+    for (const jobId of lw.jobs) {
+      const wasRunning = this.running.has(jobId);
+      this.offers.delete(jobId);
+      this.running.delete(jobId);
+      if (wasRunning) this.db.recordWorkerFailure(workerId);
+      const job = this.db.getJob(jobId);
+      if (
+        job &&
+        (job.status === 'queued' || job.status === 'assigned' || job.status === 'running')
+      ) {
+        this.db.updateJob(jobId, { status: 'queued', workerId: null });
+        this.log(`job ${jobId} re-queued (worker left)`);
       }
     }
     this.dispatch();
@@ -377,12 +498,8 @@ export class Coordinator {
 
   private onJobAccept(lw: LiveWorker, jobId: string): void {
     const offer = this.offers.get(jobId);
-    if (!offer || offer.workerId !== lw.workerId || lw.jobId !== jobId) {
-      // Stale or unsolicited accept — ignore.
-      return;
-    }
+    if (!offer || offer.workerId !== lw.workerId || !lw.jobs.has(jobId)) return;
     this.offers.delete(jobId);
-    lw.state = 'busy';
     this.db.setWorkerStatus(lw.workerId, 'busy');
     this.db.updateJob(jobId, { status: 'assigned', workerId: lw.workerId });
     this.running.set(jobId, {
@@ -397,12 +514,12 @@ export class Coordinator {
     if (!offer || offer.workerId !== lw.workerId) return;
     this.offers.delete(jobId);
     this.declined.add(`${jobId}|${lw.workerId}`);
-    this.freeWorker(lw);
+    this.freeWorkerJob(lw, jobId);
     this.dispatch();
   }
 
   private onJobProgress(lw: LiveWorker, jobId: string): void {
-    if (lw.jobId !== jobId) return;
+    if (!lw.jobs.has(jobId)) return;
     if (this.db.getJob(jobId)?.status === 'assigned') {
       this.db.updateJob(jobId, { status: 'running' });
     }
@@ -414,82 +531,147 @@ export class Coordinator {
     resultText: string,
     outputFiles: JobFile[],
     tokenUsage: TokenUsage,
+    attestation: Attestation,
   ): void {
-    if (lw.jobId !== jobId) return; // stale result for a re-queued job
+    if (!lw.jobs.has(jobId)) return; // stale result for a re-queued job
     const job = this.db.getJob(jobId);
     if (!job) return;
 
-    // 1. Verify the worker's token-usage report. The coordinator bills the
-    //    verified cost, not the asserted one.
+    this.running.delete(jobId);
+    this.declined.delete(`${jobId}|${lw.workerId}`);
+    this.freeWorkerJob(lw, jobId);
+
+    // 1. Structural result check. An unusable result fails the job outright.
+    const resultCheck = checkResult(resultText, outputFiles);
+    if (!isResultUsable(resultText, outputFiles)) {
+      this.ledger.refundJob(jobId, job.buyerId, job.maxCredits);
+      this.db.recordWorkerFailure(lw.workerId);
+      this.db.updateJob(jobId, {
+        status: 'failed',
+        workerId: lw.workerId,
+        resultText,
+        outputFiles,
+        tokenUsage,
+        attestation,
+        resultCheck,
+        error: 'result check failed: ' + resultCheck.reasons.join('; '),
+      });
+      this.log(`job ${jobId} rejected — unusable result`);
+      this.dispatch();
+      return;
+    }
+
+    // 2. Verify the token-usage report and price the job.
     const verification = verifyUsage(tokenUsage, job.adapter, {
       inputChars: job.prompt.length + sumChars(job.inputFiles),
       outputChars: resultText.length + sumChars(outputFiles),
     });
-
-    // 2. Apply the worker's price multiplier on top of the verified cost.
     const measuredCredits = usdToCredits(verification.verifiedCostUsd);
-    const pricedCredits = Math.max(
-      0,
-      Math.ceil(measuredCredits * lw.priceMultiplier),
-    );
-    const settlement = computeSettlement(
-      pricedCredits,
-      job.maxCredits,
-      this.platformFee,
-    );
+    const pricedCredits = Math.max(0, Math.ceil(measuredCredits * lw.priceMultiplier));
+    const settlement = computeSettlement(pricedCredits, job.maxCredits, this.platformFee);
 
-    // 3. Settle the ledger and update worker stats.
-    const workerInfo = this.db.getWorker(lw.workerId);
-    if (workerInfo) {
-      this.ledger.settleJob(
-        jobId,
-        job.buyerId,
-        workerInfo.userId,
-        job.maxCredits,
+    // 3. Settle immediately, or deliver into the acceptance window.
+    if (this.acceptanceWindowMs === 0) {
+      this.applySettlement(job, lw.workerId, settlement, verification.ok);
+      this.db.updateJob(jobId, {
+        status: 'completed',
+        workerId: lw.workerId,
+        resultText,
+        outputFiles,
+        tokenUsage,
+        verification,
+        attestation,
+        resultCheck,
         settlement,
+        costCredits: settlement.charged,
+      });
+      this.log(
+        `job ${jobId} completed — charged ${settlement.charged}, worker earned ${settlement.workerEarned}`,
       );
-      this.db.recordWorkerCompletion(lw.workerId, settlement.workerEarned);
-      if (!verification.ok) {
-        this.db.recordWorkerFlag(lw.workerId);
-        this.log(`job ${jobId} usage flagged: ${verification.reasons.join('; ')}`);
-      }
+    } else {
+      this.db.updateJob(jobId, {
+        status: 'delivered',
+        workerId: lw.workerId,
+        resultText,
+        outputFiles,
+        tokenUsage,
+        verification,
+        attestation,
+        resultCheck,
+        settlement,
+        deliveredAt: Date.now(),
+      });
+      this.log(`job ${jobId} delivered — awaiting buyer acceptance`);
     }
-
-    this.db.updateJob(jobId, {
-      status: 'completed',
-      resultText,
-      outputFiles,
-      tokenUsage,
-      costCredits: settlement.charged,
-      verification,
-    });
-    this.running.delete(jobId);
-    this.declined.delete(`${jobId}|${lw.workerId}`);
-    this.log(
-      `job ${jobId} completed — charged ${settlement.charged}, worker earned ${settlement.workerEarned}`,
-    );
-    this.freeWorker(lw);
     this.dispatch();
   }
 
   private onJobFailed(lw: LiveWorker, jobId: string, error: string): void {
-    if (lw.jobId !== jobId) return;
+    if (!lw.jobs.has(jobId)) return;
     const job = this.db.getJob(jobId);
+    this.running.delete(jobId);
+    this.freeWorkerJob(lw, jobId);
     if (job && job.status !== 'completed' && job.status !== 'failed') {
       this.ledger.refundJob(jobId, job.buyerId, job.maxCredits);
       this.db.updateJob(jobId, { status: 'failed', error });
       this.db.recordWorkerFailure(lw.workerId);
       this.log(`job ${jobId} failed: ${error}`);
     }
-    this.running.delete(jobId);
-    this.freeWorker(lw);
     this.dispatch();
   }
 
-  private freeWorker(lw: LiveWorker): void {
-    lw.state = 'idle';
-    lw.jobId = null;
-    if (this.live.has(lw.workerId)) this.db.setWorkerStatus(lw.workerId, 'idle');
+  // --- Settlement of delivered jobs ---------------------------------------
+
+  /** Move credits for a settled job and update the worker's lifetime stats. */
+  private applySettlement(
+    job: Job,
+    workerId: string,
+    settlement: Settlement,
+    verificationOk: boolean,
+  ): void {
+    const workerInfo = this.db.getWorker(workerId);
+    if (!workerInfo) return;
+    this.ledger.settleJob(
+      job.id,
+      job.buyerId,
+      workerInfo.userId,
+      job.maxCredits,
+      settlement,
+    );
+    this.db.recordWorkerCompletion(workerId, settlement.workerEarned);
+    if (!verificationOk) {
+      this.db.recordWorkerFlag(workerId);
+      this.log(`job ${job.id} usage was flagged`);
+    }
+  }
+
+  /** Pay out a delivered job (buyer accepted, window expired, or arbitrated). */
+  private releaseDeliveredJob(job: Job, resolution: Resolution | null): void {
+    if (!job.settlement || !job.workerId) return;
+    this.applySettlement(job, job.workerId, job.settlement, job.verification?.ok ?? true);
+    this.db.updateJob(job.id, {
+      status: 'completed',
+      costCredits: job.settlement.charged,
+      resolution,
+    });
+  }
+
+  /** Refund a disputed job's full escrow to the buyer; the worker is not paid. */
+  private refundDeliveredJob(job: Job): void {
+    this.ledger.refundJob(job.id, job.buyerId, job.maxCredits);
+    if (job.workerId) this.db.recordWorkerFailure(job.workerId);
+    this.db.updateJob(job.id, {
+      status: 'completed',
+      costCredits: 0,
+      resolution: 'buyer',
+    });
+  }
+
+  private freeWorkerJob(lw: LiveWorker, jobId: string): void {
+    lw.jobs.delete(jobId);
+    if (this.live.has(lw.workerId)) {
+      this.db.setWorkerStatus(lw.workerId, lw.jobs.size > 0 ? 'busy' : 'idle');
+    }
   }
 
   // --- Matching ------------------------------------------------------------
@@ -504,15 +686,14 @@ export class Coordinator {
   }
 
   /**
-   * Pick the best worker for a job. Eligible workers are idle, offer the
-   * requested adapter, have not declined the job, and price themselves within
-   * the buyer's limit. Among those, the cheapest wins; reputation breaks ties.
-   * This is the network's price-competition mechanism.
+   * Pick the best worker for a job: idle capacity, offers the adapter, has not
+   * declined the job, priced within the buyer's limit. Cheapest wins, with
+   * reputation as the tiebreaker.
    */
   private findWorkerFor(job: Job): LiveWorker | null {
     const eligible: { lw: LiveWorker; reputation: number }[] = [];
     for (const lw of this.live.values()) {
-      if (lw.state !== 'idle') continue;
+      if (lw.jobs.size >= lw.capacity) continue;
       if (!lw.adapters.includes(job.adapter)) continue;
       if (this.declined.has(`${job.id}|${lw.workerId}`)) continue;
       if (
@@ -526,15 +707,13 @@ export class Coordinator {
     if (eligible.length === 0) return null;
     eligible.sort(
       (a, b) =>
-        a.lw.priceMultiplier - b.lw.priceMultiplier ||
-        b.reputation - a.reputation,
+        a.lw.priceMultiplier - b.lw.priceMultiplier || b.reputation - a.reputation,
     );
     return eligible[0]!.lw;
   }
 
   private offerJob(job: Job, worker: LiveWorker): void {
-    worker.state = 'offered';
-    worker.jobId = job.id;
+    worker.jobs.add(job.id);
     this.offers.set(job.id, {
       workerId: worker.workerId,
       expiresAt: Date.now() + OFFER_TIMEOUT_MS,
@@ -552,23 +731,25 @@ export class Coordinator {
     this.log(`offered job ${job.id} to ${worker.workerId}`);
   }
 
-  /** Periodic sweep: expire stale offers and re-queue stuck jobs. */
+  /** Periodic sweep: expire offers, re-queue stuck jobs, release held jobs. */
   private sweep(): void {
     const now = Date.now();
+
     for (const [jobId, offer] of this.offers) {
       if (offer.expiresAt > now) continue;
       this.offers.delete(jobId);
       this.declined.add(`${jobId}|${offer.workerId}`);
       const lw = this.live.get(offer.workerId);
-      if (lw && lw.jobId === jobId) this.freeWorker(lw);
+      if (lw) this.freeWorkerJob(lw, jobId);
       this.log(`offer for job ${jobId} expired`);
     }
+
     for (const [jobId, run] of this.running) {
       if (run.expiresAt > now) continue;
       this.running.delete(jobId);
       this.declined.add(`${jobId}|${run.workerId}`);
       const lw = this.live.get(run.workerId);
-      if (lw && lw.jobId === jobId) this.freeWorker(lw);
+      if (lw) this.freeWorkerJob(lw, jobId);
       const job = this.db.getJob(jobId);
       if (job && (job.status === 'assigned' || job.status === 'running')) {
         this.db.updateJob(jobId, { status: 'queued', workerId: null });
@@ -576,9 +757,17 @@ export class Coordinator {
         this.log(`job ${jobId} timed out — re-queued`);
       }
     }
-    if (this.offers.size === 0 && this.running.size === 0) {
-      // Nothing pending; opportunistically match anything still queued.
+
+    // Auto-release delivered jobs whose acceptance window has elapsed.
+    if (this.acceptanceWindowMs > 0) {
+      for (const job of this.db.listJobsByStatus('delivered')) {
+        if (job.deliveredAt && job.deliveredAt + this.acceptanceWindowMs <= now) {
+          this.releaseDeliveredJob(job, null);
+          this.log(`job ${job.id} auto-accepted (window elapsed)`);
+        }
+      }
     }
+
     this.dispatch();
   }
 
