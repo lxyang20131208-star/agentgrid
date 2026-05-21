@@ -17,13 +17,17 @@ import {
   parseWorkerMessage,
   type CoordinatorMessage,
 } from '../shared/protocol.js';
+import { reputationScore } from '../shared/reputation.js';
+import { verifyUsage } from '../shared/verification.js';
 import type {
   AccountInfo,
   AdapterName,
   Job,
+  JobFile,
   JobSpec,
   NetworkStats,
   PublicWorker,
+  TokenUsage,
 } from '../shared/types.js';
 import { AgentGridDB, type User } from './db.js';
 import { Ledger } from './ledger.js';
@@ -52,6 +56,8 @@ interface LiveWorker {
   userId: string;
   ws: WebSocket;
   adapters: AdapterName[];
+  /** The worker's advertised price: buyers pay measuredCost * this. */
+  priceMultiplier: number;
   state: 'idle' | 'offered' | 'busy';
   jobId: string | null;
 }
@@ -204,6 +210,7 @@ export class Coordinator {
       spec.prompt,
       spec.inputFiles,
       spec.maxCredits,
+      spec.maxPriceMultiplier ?? null,
     );
     try {
       // Escrow the full budget up front so the worker is guaranteed payment.
@@ -234,8 +241,26 @@ export class Coordinator {
       adapters: w.adapters,
       status: this.live.has(w.id) ? w.status : 'offline',
       jobsCompleted: w.jobsCompleted,
+      jobsFailed: w.jobsFailed,
+      reputation: reputationScore({
+        jobsCompleted: w.jobsCompleted,
+        jobsFailed: w.jobsFailed,
+        flaggedReports: w.flaggedReports,
+      }),
+      priceMultiplier: w.priceMultiplier,
       lastSeen: w.lastSeen,
     }));
+  }
+
+  /** Current 0-100 reputation score for a worker. */
+  private workerReputation(workerId: string): number {
+    const w = this.db.getWorker(workerId);
+    if (!w) return 0;
+    return reputationScore({
+      jobsCompleted: w.jobsCompleted,
+      jobsFailed: w.jobsFailed,
+      flaggedReports: w.flaggedReports,
+    });
   }
 
   getStats(): NetworkStats {
@@ -266,19 +291,26 @@ export class Coordinator {
       }
 
       if (msg.type === 'register') {
-        const worker = this.db.upsertWorker(user.id, msg.name, msg.adapters);
+        const priceMultiplier = msg.priceMultiplier ?? 1;
+        const worker = this.db.upsertWorker(
+          user.id,
+          msg.name,
+          msg.adapters,
+          priceMultiplier,
+        );
         workerId = worker.id;
         this.live.set(worker.id, {
           workerId: worker.id,
           userId: user.id,
           ws,
           adapters: msg.adapters,
+          priceMultiplier,
           state: 'idle',
           jobId: null,
         });
         this.db.setWorkerStatus(worker.id, 'idle');
         send(ws, { type: 'registered', workerId: worker.id });
-        this.log(`worker ${worker.name} online (${worker.id})`);
+        this.log(`worker ${worker.name} online (${worker.id}) @ ${priceMultiplier}x`);
         this.dispatch();
         return;
       }
@@ -330,6 +362,8 @@ export class Coordinator {
     if (lw.jobId) {
       this.offers.delete(lw.jobId);
       this.running.delete(lw.jobId);
+      // Abandoning a job mid-flight counts against the worker's reputation.
+      if (lw.state === 'busy') this.db.recordWorkerFailure(workerId);
       const job = this.db.getJob(lw.jobId);
       if (job && (job.status === 'queued' || job.status === 'assigned' || job.status === 'running')) {
         this.db.updateJob(lw.jobId, { status: 'queued', workerId: null });
@@ -378,26 +412,56 @@ export class Coordinator {
     lw: LiveWorker,
     jobId: string,
     resultText: string,
-    outputFiles: { path: string; content: string }[],
-    tokenUsage: Job['tokenUsage'],
+    outputFiles: JobFile[],
+    tokenUsage: TokenUsage,
   ): void {
     if (lw.jobId !== jobId) return; // stale result for a re-queued job
     const job = this.db.getJob(jobId);
-    if (!job || !tokenUsage) return;
+    if (!job) return;
 
-    const measured = usdToCredits(tokenUsage.costUsd);
-    const settlement = computeSettlement(measured, job.maxCredits, this.platformFee);
+    // 1. Verify the worker's token-usage report. The coordinator bills the
+    //    verified cost, not the asserted one.
+    const verification = verifyUsage(tokenUsage, job.adapter, {
+      inputChars: job.prompt.length + sumChars(job.inputFiles),
+      outputChars: resultText.length + sumChars(outputFiles),
+    });
+
+    // 2. Apply the worker's price multiplier on top of the verified cost.
+    const measuredCredits = usdToCredits(verification.verifiedCostUsd);
+    const pricedCredits = Math.max(
+      0,
+      Math.ceil(measuredCredits * lw.priceMultiplier),
+    );
+    const settlement = computeSettlement(
+      pricedCredits,
+      job.maxCredits,
+      this.platformFee,
+    );
+
+    // 3. Settle the ledger and update worker stats.
     const workerInfo = this.db.getWorker(lw.workerId);
     if (workerInfo) {
-      this.ledger.settleJob(jobId, job.buyerId, workerInfo.userId, job.maxCredits, settlement);
+      this.ledger.settleJob(
+        jobId,
+        job.buyerId,
+        workerInfo.userId,
+        job.maxCredits,
+        settlement,
+      );
       this.db.recordWorkerCompletion(lw.workerId, settlement.workerEarned);
+      if (!verification.ok) {
+        this.db.recordWorkerFlag(lw.workerId);
+        this.log(`job ${jobId} usage flagged: ${verification.reasons.join('; ')}`);
+      }
     }
+
     this.db.updateJob(jobId, {
       status: 'completed',
       resultText,
       outputFiles,
       tokenUsage,
       costCredits: settlement.charged,
+      verification,
     });
     this.running.delete(jobId);
     this.declined.delete(`${jobId}|${lw.workerId}`);
@@ -414,6 +478,7 @@ export class Coordinator {
     if (job && job.status !== 'completed' && job.status !== 'failed') {
       this.ledger.refundJob(jobId, job.buyerId, job.maxCredits);
       this.db.updateJob(jobId, { status: 'failed', error });
+      this.db.recordWorkerFailure(lw.workerId);
       this.log(`job ${jobId} failed: ${error}`);
     }
     this.running.delete(jobId);
@@ -438,14 +503,33 @@ export class Coordinator {
     }
   }
 
+  /**
+   * Pick the best worker for a job. Eligible workers are idle, offer the
+   * requested adapter, have not declined the job, and price themselves within
+   * the buyer's limit. Among those, the cheapest wins; reputation breaks ties.
+   * This is the network's price-competition mechanism.
+   */
   private findWorkerFor(job: Job): LiveWorker | null {
+    const eligible: { lw: LiveWorker; reputation: number }[] = [];
     for (const lw of this.live.values()) {
       if (lw.state !== 'idle') continue;
       if (!lw.adapters.includes(job.adapter)) continue;
       if (this.declined.has(`${job.id}|${lw.workerId}`)) continue;
-      return lw;
+      if (
+        job.maxPriceMultiplier !== undefined &&
+        lw.priceMultiplier > job.maxPriceMultiplier
+      ) {
+        continue;
+      }
+      eligible.push({ lw, reputation: this.workerReputation(lw.workerId) });
     }
-    return null;
+    if (eligible.length === 0) return null;
+    eligible.sort(
+      (a, b) =>
+        a.lw.priceMultiplier - b.lw.priceMultiplier ||
+        b.reputation - a.reputation,
+    );
+    return eligible[0]!.lw;
   }
 
   private offerJob(job: Job, worker: LiveWorker): void {
@@ -488,6 +572,7 @@ export class Coordinator {
       const job = this.db.getJob(jobId);
       if (job && (job.status === 'assigned' || job.status === 'running')) {
         this.db.updateJob(jobId, { status: 'queued', workerId: null });
+        this.db.recordWorkerFailure(run.workerId);
         this.log(`job ${jobId} timed out — re-queued`);
       }
     }
@@ -504,6 +589,10 @@ export class Coordinator {
 
 function hashKey(apiKey: string): string {
   return createHash('sha256').update(apiKey).digest('hex');
+}
+
+function sumChars(files: JobFile[]): number {
+  return files.reduce((n, f) => n + f.content.length, 0);
 }
 
 function send(ws: WebSocket, msg: CoordinatorMessage): void {

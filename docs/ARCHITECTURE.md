@@ -90,6 +90,23 @@ Four transaction kinds:
 | `job_settle`   | `escrow → worker`, `escrow → system` (fee), `escrow → buyer` (refund) |
 | `job_refund`   | `escrow → buyer`                                                |
 
+## Matching, pricing and verification
+
+- **Matching.** When a job is queued, the coordinator collects every idle
+  worker that offers the job's adapter, has not declined it, and prices itself
+  within the buyer's `maxPriceMultiplier`. It picks the **cheapest**; reputation
+  breaks ties. This is the network's price-competition mechanism.
+- **Pricing.** Each worker advertises a `priceMultiplier`. The buyer is billed
+  `verifiedCost × multiplier`, still capped at the escrowed budget.
+- **Verification** (`src/shared/verification.ts`). Before settling, the
+  coordinator bounds the worker's token-usage report: worker-estimated costs
+  are clamped to a rate-table plausibility range, and any cost is clamped by a
+  hard per-token ceiling. The buyer is billed the verified figure; an
+  implausible report is flagged against the worker.
+- **Reputation** (`src/shared/reputation.ts`). A 0-100 Bayesian score from each
+  worker's completed jobs, failed jobs and flagged reports. Used as the
+  matching tiebreaker and surfaced to buyers.
+
 ## Job lifecycle
 
 ```
@@ -104,16 +121,16 @@ Four transaction kinds:
 
 1. **submit** — the client `POST`s a job. The coordinator escrows
    `maxCredits` from the buyer and stores the job as `queued`.
-2. **dispatch** — the matcher finds an idle worker offering the job's adapter
-   and sends a `job_offer`.
+2. **dispatch** — the matcher finds the cheapest eligible worker offering the
+   job's adapter (reputation breaks ties) and sends a `job_offer`.
 3. **accept** — the worker replies `job_accept`; the job becomes `assigned`.
    (A decline or a 15s timeout returns the job to the queue for another worker.)
 4. **run** — the worker executes the job locally. It may emit `job_progress`,
    which moves the job to `running`.
 5. **result** — the worker sends `job_result` with the output and measured
-   token usage. The coordinator settles the ledger and marks the job
-   `completed`. On `job_failed`, the escrow is fully refunded and the job is
-   `failed`.
+   token usage. The coordinator *verifies* that usage, applies the worker's
+   price multiplier, settles the ledger, and marks the job `completed`. On
+   `job_failed`, the escrow is fully refunded and the job is `failed`.
 6. **timeout / disconnect** — if a worker vanishes mid-job, the job is
    re-queued so another worker can pick it up.
 

@@ -10,13 +10,15 @@ import { ADAPTER, JOB_FILE } from '../shared/protocol.js';
 import { InsufficientCreditsError } from './ledger.js';
 import type { Coordinator } from './index.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 const JOB_SUBMIT = z.object({
   adapter: ADAPTER,
   prompt: z.string().min(1).max(100_000),
   inputFiles: z.array(JOB_FILE).max(200).optional(),
   maxCredits: z.number().int().positive().max(100_000_000),
+  /** Refuse workers priced above this multiplier. Omit for no limit. */
+  maxPriceMultiplier: z.number().positive().max(100).optional(),
 });
 
 const REGISTER = z.object({
@@ -120,6 +122,7 @@ export function createHttpHandler(coord: Coordinator) {
             prompt: parsed.data.prompt,
             inputFiles: parsed.data.inputFiles ?? [],
             maxCredits: parsed.data.maxCredits,
+            maxPriceMultiplier: parsed.data.maxPriceMultiplier,
           });
           return sendJson(res, 201, { job });
         } catch (err) {

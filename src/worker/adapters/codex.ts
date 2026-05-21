@@ -8,7 +8,7 @@
 // Because Codex does not report a dollar cost, cost is estimated from a
 // configurable token-rate table (see shared/pricing.ts).
 
-import { run, commandExists, estimateTokens } from './exec.js';
+import { commandExists, estimateTokens } from './exec.js';
 import { DEFAULT_TOKEN_RATES, estimateCostUsd } from '../../shared/pricing.js';
 import { makeUsage, type AgentAdapter, type ExecuteContext, type ExecuteResult } from './types.js';
 
@@ -55,8 +55,7 @@ export class CodexAdapter implements AgentAdapter {
     // their names vary by version; see docs/TRUST-AND-SECURITY.md.
     const args = ['exec', '--json', '--skip-git-repo-check', ctx.prompt];
 
-    const res = await run('codex', args, {
-      cwd: ctx.workdir,
+    const res = await ctx.run('codex', args, {
       signal: ctx.signal,
       timeoutMs: 9 * 60_000,
     });

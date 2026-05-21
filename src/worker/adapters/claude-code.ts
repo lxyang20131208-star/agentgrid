@@ -5,7 +5,7 @@
 // Claude Code reports its own dollar cost, metering for this adapter is exact
 // rather than estimated.
 
-import { run, commandExists } from './exec.js';
+import { commandExists } from './exec.js';
 import { makeUsage, type AgentAdapter, type ExecuteContext, type ExecuteResult } from './types.js';
 
 /** Shape of the JSON object emitted by `claude -p --output-format json`. */
@@ -42,8 +42,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
       ctx.permissionMode,
     ];
 
-    const res = await run('claude', args, {
-      cwd: ctx.workdir,
+    const res = await ctx.run('claude', args, {
       signal: ctx.signal,
       timeoutMs: 9 * 60_000,
     });

@@ -28,6 +28,8 @@ export const WORKER_REGISTER = z.object({
   type: z.literal('register'),
   name: z.string().min(1).max(64),
   adapters: z.array(ADAPTER).min(1),
+  /** The worker's price: buyers pay measuredCost * priceMultiplier. */
+  priceMultiplier: z.number().min(0.1).max(100).optional(),
 });
 
 export const WORKER_HEARTBEAT = z.object({

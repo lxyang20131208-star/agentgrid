@@ -59,6 +59,38 @@ transaction, so credits can never be silently created or lost. See
 
 ---
 
+## Marketplace mechanics
+
+AgentGrid is a real two-sided market, not just a job queue.
+
+- **Pricing & bidding.** Each worker advertises a *price multiplier* — buyers
+  pay `measuredCost × multiplier`. A worker can undercut the field
+  (`--price 0.8`) to win more jobs or charge a premium for reputation. When
+  several workers can do a job, **the cheapest one wins**; reputation breaks
+  ties. Buyers can cap what they will pay with `--max-price`.
+
+- **Token-usage verification.** Workers self-report token usage, but the
+  coordinator does not take it on faith. It independently bounds every report:
+  worker-estimated costs are clamped to a rate-table plausibility range, and
+  absurd figures are clamped by a hard per-token ceiling. The buyer is billed
+  the **verified** cost, and an implausible report is flagged against the
+  worker. Provider-attested costs (Claude Code reports its own dollar figure)
+  are trusted within the ceiling.
+
+- **Reputation.** Every worker carries a 0-100 score derived from its record:
+  jobs completed, jobs failed, and flagged usage reports. A flagged report
+  hurts more than an honest failure. New workers start neutral (Bayesian
+  prior). Reputation is the tiebreaker when prices are equal.
+
+- **Sandboxing.** A worker runs untrusted prompts, so it can isolate them:
+  `none` (trusted groups), `restricted` (environment scrubbed to an allowlist),
+  or `container` (a locked-down `docker` container with the workspace
+  bind-mounted, resource limits and dropped capabilities). See
+  [`docs/TRUST-AND-SECURITY.md`](docs/TRUST-AND-SECURITY.md) and
+  [`docker/Dockerfile`](docker/Dockerfile).
+
+---
+
 ## Quickstart
 
 Requires **Node.js 20+**. The `mock` adapter lets you run the entire network
@@ -110,8 +142,8 @@ what is detected on your machine.
 | ----------------------------- | ------------------------------------------------------ |
 | `agentgrid coordinator`       | Run the broker for a network.                          |
 | `agentgrid register --email`  | Create an account and save its API key.                |
-| `agentgrid worker`            | Run a worker that earns credits by executing jobs.     |
-| `agentgrid submit <prompt>`   | Submit a job (spends credits). `--wait` to block.      |
+| `agentgrid worker`            | Run a worker. `--price` to set your rate, `--sandbox` to isolate jobs. |
+| `agentgrid submit <prompt>`   | Submit a job (spends credits). `--wait` to block, `--max-price` to cap. |
 | `agentgrid status <jobId>`    | Show a job's status and result.                        |
 | `agentgrid jobs`              | List your recent jobs.                                 |
 | `agentgrid balance`           | Show your credit balance.                              |
@@ -161,16 +193,18 @@ docs/            architecture, protocol, trust & security
 
 ## Roadmap
 
-AgentGrid is an MVP. Known limitations and planned work:
+**Shipped in 0.2:** token-usage verification, worker sandboxing
+(`none` / `restricted` / `container`), worker self-pricing with cheapest-wins
+bidding, and a reputation system.
 
-- **Token-report verification.** Workers currently self-report usage; a buyer's
-  exposure is bounded by their escrow, but cross-checks are future work.
-- **Worker sandboxing.** Running untrusted prompts should happen in a container;
-  today this is the worker operator's responsibility.
-- **Marketplace pricing.** Workers should be able to set their own rates and
-  compete; v1 charges measured cost flat.
-- **Reputation.** Worker ratings, job verification, dispute handling.
-- **Streaming results** and richer multi-file workspaces.
+Still ahead:
+
+- **Provider-side usage attestation** — verify token counts against the
+  provider's own dashboard/API, not just plausibility bounds.
+- **Streaming results** and richer multi-file / multi-directory workspaces.
+- **Disputes & arbitration** — let a buyer contest a result after settlement.
+- **Worker capacity > 1** — run several jobs per worker concurrently.
+- **Federation** — multiple coordinators sharing a worker pool.
 
 ## Contributing
 

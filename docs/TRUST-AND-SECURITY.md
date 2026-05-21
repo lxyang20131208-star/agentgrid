@@ -33,16 +33,29 @@ A job prompt runs inside a real coding agent on the worker's computer. A hostile
 prompt could try to read files, exfiltrate data, or run destructive commands.
 
 **What AgentGrid does:** each job runs in a fresh temp directory that is deleted
-afterwards. Only the buyer's declared input files are placed there. The
-permission mode passed to the agent is configurable.
+afterwards, and only the buyer's declared input files are placed there. The
+worker chooses a **sandbox mode** for the agent process itself:
 
-**What it does NOT do:** it does not sandbox the agent process itself. A coding
-agent with tool access can still touch the wider filesystem and network.
+- `none` — the agent runs directly with the full environment. For trusted
+  groups only.
+- `restricted` — the agent runs with its environment scrubbed to an allowlist,
+  so a hostile prompt cannot read cloud credentials, SSH keys or unrelated API
+  tokens out of `process.env`. It does **not** isolate the filesystem.
+- `container` — the agent runs inside a `docker` container with only the job
+  workspace bind-mounted, memory/CPU/PID limits, all capabilities dropped and
+  `no-new-privileges` set. This is the only mode that isolates the filesystem
+  and network.
 
-**Mitigation — strongly recommended:** run the worker inside a container or VM
-with no access to anything you care about. Run it as an unprivileged user. Use
-the most restrictive permission mode that still completes jobs. Do not run a
-worker for untrusted buyers on a machine that holds secrets.
+The permission mode passed to coding agents is also configurable.
+
+**What it does NOT do:** `none` and `restricted` do not stop a tool-using agent
+from touching the wider filesystem. Only `container` does — and it is only as
+strong as your Docker setup.
+
+**Mitigation — strongly recommended:** for any untrusted buyer, run the worker
+with `--sandbox container`. Even then, run the worker as an unprivileged user
+on a machine that holds no secrets, and use the most restrictive permission
+mode that still completes jobs.
 
 ### 2. A malicious worker mishandles a buyer's data
 
@@ -61,17 +74,23 @@ you do not trust.
 Workers self-report token counts and cost. A dishonest worker could inflate the
 numbers to earn more credits.
 
-**What AgentGrid does:** the buyer escrows a fixed `maxCredits` budget. The
-charge is **capped at that budget** — a worker can never charge more than the
-buyer agreed to risk. Claude Code reports its own dollar cost, so for that
-adapter the figure is provider-attested rather than worker-asserted.
+**What AgentGrid does:** two layers of defence.
 
-**What it does NOT do:** within the budget cap, it does not independently verify
-token counts.
+1. The buyer escrows a fixed `maxCredits` budget, and the charge is **capped at
+   that budget** — a worker can never charge more than the buyer agreed to risk.
+2. The coordinator **verifies every usage report** (`src/shared/verification.ts`).
+   Worker-estimated costs are clamped to a rate-table plausibility bound; any
+   cost is clamped by a hard per-token ceiling. The buyer is billed the
+   *verified* cost, and an implausible report is flagged against the worker's
+   reputation. Claude Code's cost is provider-attested, so it is trusted within
+   the absolute ceiling.
 
-**Mitigation:** set conservative `maxCredits` budgets. Prefer the `claude-code`
-adapter, whose cost is provider-reported. Provider-side usage verification is on
-the roadmap.
+**What it does NOT do:** verification bounds the *plausibility* of a report; it
+does not cryptographically attest the exact token count with the provider.
+
+**Mitigation:** set conservative `maxCredits` budgets and prefer the
+`claude-code` adapter, whose cost is provider-reported. Provider-side usage
+attestation is on the roadmap.
 
 ### 4. Credit integrity
 
@@ -90,9 +109,13 @@ non-local deployment (e.g. a reverse proxy) so keys are not sent in clear text.
 
 ## Known gaps (roadmap)
 
-- **No agent-process sandboxing.** Containerisation is the operator's job today.
-- **No token-report verification** beyond the escrow budget cap.
-- **No worker reputation or job-result verification.**
+Addressed in 0.2: agent-process sandboxing (`container` mode), token-usage
+verification, and worker reputation. Still open:
+
+- **No provider-side usage attestation.** Verification bounds plausibility but
+  does not confirm exact token counts with the provider.
+- **No job-result verification.** The coordinator does not check that a result
+  actually satisfies the prompt.
 - **No dispute or refund-after-completion mechanism.**
 - **No rate limiting** on the REST API.
 - **No key rotation or revocation.**

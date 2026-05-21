@@ -26,7 +26,7 @@ const program = new Command();
 program
   .name('agentgrid')
   .description('A peer-to-peer grid for renting and sharing AI agent compute.')
-  .version('0.1.0');
+  .version('0.2.0');
 
 // --- coordinator -----------------------------------------------------------
 
@@ -93,6 +93,12 @@ program
   .option('-n, --name <name>', 'worker display name', `worker-${process.pid}`)
   .option('-a, --adapters <list>', 'comma-separated adapters (default: auto-detect)')
   .option('-m, --permission-mode <mode>', 'permission mode for coding agents', 'acceptEdits')
+  .option('--price <multiplier>', 'your price — buyers pay measuredCost × this', '1')
+  .option('-s, --sandbox <mode>', 'sandbox: none, restricted, or container', 'none')
+  .option('--container-image <image>', 'docker image for container sandbox', 'agentgrid-worker')
+  .option('--container-memory <mem>', 'memory limit for container sandbox', '2g')
+  .option('--container-cpus <cpus>', 'cpu limit for container sandbox', '2')
+  .option('--container-network <net>', 'docker network for container sandbox', 'bridge')
   .option('-u, --url <url>', 'coordinator URL')
   .action(async (opts) => {
     const config = loadConfig();
@@ -109,6 +115,14 @@ program
       name: opts.name,
       adapters,
       permissionMode: opts.permissionMode,
+      priceMultiplier: Number(opts.price),
+      sandbox: {
+        mode: opts.sandbox,
+        containerImage: opts.containerImage,
+        containerMemory: opts.containerMemory,
+        containerCpus: opts.containerCpus,
+        containerNetwork: opts.containerNetwork,
+      },
     });
     await worker.start();
     console.log('Worker online. Press Ctrl+C to stop.');
@@ -127,6 +141,7 @@ program
   .option('-a, --adapter <name>', 'adapter to run on (claude-code, codex, mock)', 'mock')
   .option('-f, --file <path>', 'attach an input file (repeatable)', collect, [])
   .option('-b, --budget <credits>', 'max credits to spend', '5000')
+  .option('--max-price <multiplier>', 'refuse workers priced above this multiplier')
   .option('-w, --wait', 'wait for the job to finish and print the result')
   .option('-u, --url <url>', 'coordinator URL')
   .action(async (prompt: string | undefined, opts) => {
@@ -147,6 +162,7 @@ program
         prompt: text,
         inputFiles,
         maxCredits: Number(opts.budget),
+        maxPriceMultiplier: opts.maxPrice ? Number(opts.maxPrice) : undefined,
       });
       console.log(`Submitted job ${job.id} (budget ${job.maxCredits} credits)`);
 
@@ -241,7 +257,9 @@ program
       }
       for (const w of workers) {
         console.log(
-          `${w.name.padEnd(20)}  ${w.status.padEnd(8)}  ${w.adapters.join(',').padEnd(24)}  ${w.jobsCompleted} jobs`,
+          `${w.name.padEnd(18)}  ${w.status.padEnd(8)}  rep ${String(w.reputation).padStart(3)}  ` +
+            `${String(w.priceMultiplier).padStart(5)}x  ${w.adapters.join(',').padEnd(22)}  ` +
+            `${w.jobsCompleted}✓ ${w.jobsFailed}✗`,
         );
       }
     } catch (err) {
@@ -307,6 +325,7 @@ function printJob(job: {
   resultText: string | null;
   error: string | null;
   tokenUsage: { totalTokens: number; costUsd: number; estimated: boolean } | null;
+  verification: { ok: boolean; reasons: string[]; verifiedCostUsd: number } | null;
   outputFiles: JobFile[] | null;
 }): void {
   console.log(`Job ${job.id}`);
@@ -319,6 +338,11 @@ function printJob(job: {
     );
   }
   if (job.costCredits !== null) console.log(`  Charged: ${job.costCredits} credits`);
+  if (job.verification && !job.verification.ok) {
+    console.log(`  Usage:   ⚠ flagged — ${job.verification.reasons.join('; ')}`);
+  } else if (job.verification) {
+    console.log('  Usage:   ✓ verified');
+  }
   if (job.error) console.log(`  Error:   ${job.error}`);
   if (job.resultText) {
     console.log('  --- result ---');

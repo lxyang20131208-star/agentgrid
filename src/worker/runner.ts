@@ -5,7 +5,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSyn
 import { tmpdir } from 'node:os';
 import { join, dirname, relative, sep } from 'node:path';
 import type { JobFile, TokenUsage } from '../shared/types.js';
-import type { AgentAdapter } from './adapters/index.js';
+import type { AgentAdapter, SandboxedRun } from './adapters/index.js';
+import type { Sandbox } from './sandbox.js';
 
 export interface RunnerJob {
   id: string;
@@ -21,6 +22,8 @@ export interface RunnerResult {
 
 export interface RunnerOptions {
   permissionMode: string;
+  /** Sandbox policy used to launch the agent process. */
+  sandbox: Sandbox;
   signal: AbortSignal;
   onProgress: (message: string) => void;
 }
@@ -54,12 +57,22 @@ export async function runJob(
     }
     const before = snapshot(workdir);
 
-    opts.onProgress(`running ${adapter.name}`);
+    // A sandbox-aware runner bound to this job's workspace. Adapters launch
+    // the agent through this so the worker's sandbox policy is always applied.
+    const sandboxedRun: SandboxedRun = (command, args, runOpts) =>
+      opts.sandbox.run(command, args, {
+        cwd: workdir,
+        signal: runOpts?.signal,
+        timeoutMs: runOpts?.timeoutMs,
+      });
+
+    opts.onProgress(`running ${adapter.name} (sandbox: ${opts.sandbox.mode})`);
     const result = await adapter.execute({
       prompt: job.prompt,
       workdir,
       permissionMode: opts.permissionMode,
       signal: opts.signal,
+      run: sandboxedRun,
       onProgress: opts.onProgress,
     });
 

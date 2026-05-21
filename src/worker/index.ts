@@ -13,6 +13,7 @@ import {
 import type { AdapterName } from '../shared/types.js';
 import { allAdapters, detectAvailableAdapters, getAdapter } from './adapters/index.js';
 import { runJob } from './runner.js';
+import { createSandbox, type Sandbox, type SandboxConfig } from './sandbox.js';
 
 export interface WorkerOptions {
   coordinatorUrl: string;
@@ -22,6 +23,10 @@ export interface WorkerOptions {
   adapters?: AdapterName[];
   /** Permission mode passed to agents that support one. */
   permissionMode?: string;
+  /** The worker's price: buyers pay measuredCost * priceMultiplier. Default 1. */
+  priceMultiplier?: number;
+  /** Sandbox policy for running jobs. Default { mode: 'none' }. */
+  sandbox?: SandboxConfig;
   /** Suppress console logging (used by tests). */
   quiet?: boolean;
   /** Reconnect automatically when the connection drops. Default true. */
@@ -37,11 +42,15 @@ export class Worker {
   private currentAbort: AbortController | null = null;
   private adapters: AdapterName[] = [];
   private readonly permissionMode: string;
+  private readonly priceMultiplier: number;
+  private readonly sandbox: Sandbox;
   private readonly autoReconnect: boolean;
   private registeredResolvers: Array<() => void> = [];
 
   constructor(private readonly opts: WorkerOptions) {
     this.permissionMode = opts.permissionMode ?? 'acceptEdits';
+    this.priceMultiplier = opts.priceMultiplier ?? 1;
+    this.sandbox = createSandbox(opts.sandbox ?? { mode: 'none' });
     this.autoReconnect = opts.autoReconnect ?? true;
   }
 
@@ -55,6 +64,7 @@ export class Worker {
       throw new Error('no agent adapters available on this machine');
     }
     this.log(`offering adapters: ${this.adapters.join(', ')}`);
+    this.log(`price: ${this.priceMultiplier}x · sandbox: ${this.sandbox.describe()}`);
 
     const registered = new Promise<void>((resolve) => {
       this.registeredResolvers.push(resolve);
@@ -86,7 +96,12 @@ export class Worker {
     this.ws = ws;
 
     ws.on('open', () => {
-      this.send({ type: 'register', name: this.opts.name, adapters: this.adapters });
+      this.send({
+        type: 'register',
+        name: this.opts.name,
+        adapters: this.adapters,
+        priceMultiplier: this.priceMultiplier,
+      });
       this.heartbeat = setInterval(() => this.send({ type: 'heartbeat' }), 20_000);
       this.heartbeat.unref();
     });
@@ -165,6 +180,7 @@ export class Worker {
         { id: job.id, prompt: job.prompt, inputFiles: job.inputFiles },
         {
           permissionMode: this.permissionMode,
+          sandbox: this.sandbox,
           signal: abort.signal,
           onProgress: (message) =>
             this.send({ type: 'job_progress', jobId: job.id, message }),

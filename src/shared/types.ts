@@ -46,6 +46,21 @@ export interface JobSpec {
   inputFiles: JobFile[];
   /** Maximum credits the buyer is willing to spend; held in escrow. */
   maxCredits: number;
+  /**
+   * Highest worker price multiplier the buyer will accept. A worker pricing
+   * itself above this is not matched to the job. Defaults to no limit.
+   */
+  maxPriceMultiplier?: number;
+}
+
+/** Result of checking a worker's token-usage report. */
+export interface JobVerification {
+  /** True when the report passed every check unchanged. */
+  ok: boolean;
+  /** The cost the coordinator actually billed, in USD. */
+  verifiedCostUsd: number;
+  /** Reasons the report was adjusted or flagged, if any. */
+  reasons: string[];
 }
 
 /** A job as tracked by the coordinator across its lifecycle. */
@@ -59,6 +74,8 @@ export interface Job extends JobSpec {
   tokenUsage: TokenUsage | null;
   /** Final credits charged to the buyer once settled. */
   costCredits: number | null;
+  /** Outcome of token-usage verification, set when the job completes. */
+  verification: JobVerification | null;
   error: string | null;
   createdAt: number;
   updatedAt: number;
@@ -74,8 +91,14 @@ export interface WorkerInfo {
   status: WorkerStatus;
   /** Total jobs completed by this worker, all-time. */
   jobsCompleted: number;
+  /** Total jobs that failed while assigned to this worker, all-time. */
+  jobsFailed: number;
+  /** Token-usage reports the coordinator flagged as implausible. */
+  flaggedReports: number;
   /** Total credits earned by this worker, all-time. */
   creditsEarned: number;
+  /** The worker's price: buyers are charged measuredCost * priceMultiplier. */
+  priceMultiplier: number;
   lastSeen: number;
 }
 
@@ -85,6 +108,10 @@ export interface PublicWorker {
   adapters: AdapterName[];
   status: WorkerStatus;
   jobsCompleted: number;
+  jobsFailed: number;
+  /** Computed 0-100 reputation score. */
+  reputation: number;
+  priceMultiplier: number;
   lastSeen: number;
 }
 
